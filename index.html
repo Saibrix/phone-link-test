@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Phone Link Test</title>
+<style>
+  :root { --bg:#14161c; --card:#1f232d; --fg:#eef0f5; --mut:#9aa3b5; --acc:#6c8cff; --ok:#3ecf8e; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:16px/1.4 system-ui,-apple-system,sans-serif; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:10px; padding:12px 16px; font-size:16px; margin:4px 4px 4px 0; }
+  button.sec { background:#394058; }
+  textarea, input { width:100%; background:#14161c; color:var(--fg); border:1px solid #394058; border-radius:8px; padding:10px; font-size:16px; }
+  textarea { height:90px; font-family:monospace; font-size:12px; }
+  #qr { background:#fff; padding:10px; border-radius:8px; display:inline-block; margin:8px 0; }
+  #qr:empty { display:none; }
+  video { width:100%; border-radius:8px; background:#000; }
+  #status { font-weight:600; }
+  #log { height:180px; overflow:auto; background:#14161c; border-radius:8px; padding:8px; font-size:14px; }
+  .hide { display:none; }
+  small { color:var(--mut); }
+</style>
+</head>
+<body>
+<h1>Phone Link Test</h1>
+
+<div class="card">Status: <span id="status">not connected</span><br><small id="detail"></small></div>
+
+<div class="card" id="start">
+  <button id="btnHost">I am the host</button>
+  <button id="btnJoin" class="sec">I am joining</button>
+</div>
+
+<div class="card hide" id="hostBox">
+  <b>Step 1 (host):</b> show this code to the other phone.<br>
+  <div id="hostQr"></div>
+  <textarea id="hostCode" readonly></textarea>
+  <button id="copyHost" class="sec">Copy code</button>
+  <hr style="border-color:#394058">
+  <b>Step 2 (host):</b> scan or paste the reply from the other phone.<br>
+  <textarea id="hostReply" placeholder="paste reply code here"></textarea>
+  <button id="scanReply" class="sec">Scan reply with camera</button>
+  <button id="applyReply">Connect</button>
+</div>
+
+<div class="card hide" id="joinBox">
+  <b>Step 1 (joiner):</b> scan or paste the host's code.<br>
+  <textarea id="joinInput" placeholder="paste host code here"></textarea>
+  <button id="scanHost" class="sec">Scan host code with camera</button>
+  <button id="applyHost">Create reply</button>
+  <div id="joinOut" class="hide">
+    <hr style="border-color:#394058">
+    <b>Step 2 (joiner):</b> show this reply to the host.<br>
+    <div id="joinQr"></div>
+    <textarea id="joinCode" readonly></textarea>
+    <button id="copyJoin" class="sec">Copy reply</button>
+  </div>
+</div>
+
+<div class="card hide" id="scanBox">
+  <video id="video" playsinline muted></video>
+  <button id="stopScan" class="sec">Cancel scan</button>
+</div>
+
+<div class="card hide" id="chatBox">
+  <div id="log"></div>
+  <div style="display:flex;gap:6px;margin-top:8px">
+    <input id="msg" placeholder="type a message">
+    <button id="send" style="margin:0">Send</button>
+  </div>
+  <button id="ping" class="sec">Ping (measure delay)</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const show = (id, on = true) => $(id).classList.toggle('hide', !on);
+let pc, dc, scanStream, scanTimer, scanTarget;
+
+function setStatus(text, color) {
+  $('status').textContent = text;
+  $('status').style.color = color || '';
+}
+function log(who, text) {
+  const d = document.createElement('div');
+  d.textContent = who + ': ' + text;
+  $('log').appendChild(d);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+function newPeer() {
+  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    if (s === 'connected') { setStatus('connected', 'var(--ok)'); showConnType(); }
+    else if (s === 'failed') setStatus('failed (network blocks direct link)', 'var(--bad)');
+    else setStatus(s);
+  };
+  pc.ondatachannel = e => setupChannel(e.channel);
+}
+
+async function showConnType() {
+  try {
+    const stats = await pc.getStats();
+    let pair;
+    stats.forEach(r => { if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId); });
+    if (!pair) stats.forEach(r => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
+    if (pair) {
+      const local = stats.get(pair.localCandidateId);
+      const remote = stats.get(pair.remoteCandidateId);
+      $('detail').textContent = 'link: ' + (local && local.candidateType) + ' / ' + (remote && remote.candidateType);
+    }
+  } catch (e) {}
+}
+
+function setupChannel(ch) {
+  dc = ch;
+  dc.onopen = () => { show('chatBox'); show('hostBox', false); show('joinBox', false); show('start', false); log('system', 'channel open, say hi'); };
+  dc.onclose = () => { setStatus('disconnected', 'var(--bad)'); log('system', 'channel closed'); };
+  dc.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.t === 'ping') dc.send(JSON.stringify({ t: 'pong', ts: m.ts }));
+    else if (m.t === 'pong') log('system', 'round trip ' + Math.round(performance.now() - m.ts) + ' ms');
+    else log('them', m.text);
+  };
+}
+
+function waitIce() {
+  return new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const done = () => { pc.removeEventListener('icegatheringstatechange', check); res(); };
+    const check = () => { if (pc.iceGatheringState === 'complete') done(); };
+    pc.addEventListener('icegatheringstatechange', check);
+    setTimeout(done, 5000);
+  });
+}
+
+const encode = desc => btoa(unescape(encodeURIComponent(JSON.stringify(desc))));
+const decode = txt => JSON.parse(decodeURIComponent(escape(atob(txt.trim()))));
+
+function drawQr(boxId, text) {
+  const box = $(boxId);
+  box.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.id = 'qr';
+  box.appendChild(wrap);
+  try {
+    new QRCode(wrap, { text, width: 280, height: 280, correctLevel: QRCode.CorrectLevel.L });
+  } catch (e) {
+    wrap.remove();
+    box.textContent = 'Code too big for QR, use copy/paste instead.';
+  }
+}
+
+// ----- host -----
+$('btnHost').onclick = async () => {
+  show('start', false); show('hostBox');
+  setStatus('creating code...');
+  newPeer();
+  setupChannel(pc.createDataChannel('game'));
+  await pc.setLocalDescription(await pc.createOffer());
+  await waitIce();
+  const code = encode(pc.localDescription);
+  $('hostCode').value = code;
+  drawQr('hostQr', code);
+  setStatus('waiting for the other phone');
+};
+$('applyReply').onclick = async () => {
+  try {
+    await pc.setRemoteDescription(decode($('hostReply').value));
+    setStatus('connecting...');
+  } catch (e) { setStatus('bad reply code', 'var(--bad)'); }
+};
+
+// ----- joiner -----
+$('btnJoin').onclick = () => { show('start', false); show('joinBox'); setStatus('paste or scan host code'); };
+$('applyHost').onclick = async () => {
+  try {
+    const offer = decode($('joinInput').value);
+    newPeer();
+    await pc.setRemoteDescription(offer);
+    setStatus('creating reply...');
+    await pc.setLocalDescription(await pc.createAnswer());
+    await waitIce();
+    const code = encode(pc.localDescription);
+    $('joinCode').value = code;
+    drawQr('joinQr', code);
+    show('joinOut');
+    setStatus('show the reply to the host');
+  } catch (e) { setStatus('bad host code', 'var(--bad)'); }
+};
+
+// ----- copy -----
+async function copy(id) {
+  const t = $(id);
+  try { await navigator.clipboard.writeText(t.value); } catch (e) { t.select(); document.execCommand('copy'); }
+}
+$('copyHost').onclick = () => copy('hostCode');
+$('copyJoin').onclick = () => copy('joinCode');
+
+// ----- scan -----
+async function startScan(targetId) {
+  scanTarget = targetId;
+  try {
+    scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+  } catch (e) { setStatus('camera not allowed, use paste', 'var(--bad)'); return; }
+  const v = $('video');
+  v.srcObject = scanStream;
+  await v.play();
+  show('scanBox');
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  scanTimer = setInterval(() => {
+    if (!v.videoWidth) return;
+    canvas.width = v.videoWidth; canvas.height = v.videoHeight;
+    ctx.drawImage(v, 0, 0);
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const hit = jsQR(img.data, img.width, img.height);
+    if (hit && hit.data) { $(scanTarget).value = hit.data; stopScan(); }
+  }, 250);
+}
+function stopScan() {
+  clearInterval(scanTimer);
+  if (scanStream) scanStream.getTracks().forEach(t => t.stop());
+  show('scanBox', false);
+}
+$('scanReply').onclick = () => startScan('hostReply');
+$('scanHost').onclick = () => startScan('joinInput');
+$('stopScan').onclick = stopScan;
+
+// ----- chat -----
+function sendMsg() {
+  const text = $('msg').value.trim();
+  if (!text || !dc || dc.readyState !== 'open') return;
+  dc.send(JSON.stringify({ t: 'chat', text }));
+  log('me', text);
+  $('msg').value = '';
+}
+$('send').onclick = sendMsg;
+$('msg').onkeydown = e => { if (e.key === 'Enter') sendMsg(); };
+$('ping').onclick = () => { if (dc && dc.readyState === 'open') dc.send(JSON.stringify({ t: 'ping', ts: performance.now() })); };
+</script>
+</body>
+</html>
